@@ -1,305 +1,545 @@
-#![doc = include_str!("../README.md")]
-#![doc(
-    html_logo_url = "https://raw.githubusercontent.com/alloy-rs/core/main/assets/alloy.jpg",
-    html_favicon_url = "https://raw.githubusercontent.com/alloy-rs/core/main/assets/favicon.ico"
-)]
-#![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg))]
+#![no_main]
+use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_definition::BuiltinHintProcessor;
+use cairo_vm::{
+    cairo_run::{self, CairoRunConfig},
+    Felt252,
+};
+use libfuzzer_sys::{
+    arbitrary::{Arbitrary, Unstructured},
+    fuzz_target,
+};
+use std::fs;
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use alloy_consensus::SignableTransaction;
-use alloy_network::{impl_into_wallet, TxSigner, TxSignerSync};
-use alloy_primitives::{Address, ChainId, Signature, B256};
-use alloy_signer::{sign_transaction_with_chain_id, Result, Signer, SignerSync};
-use async_trait::async_trait;
-use k256::ecdsa::{self, signature::hazmat::PrehashSigner, RecoveryId};
-use std::fmt;
+// Global counter for fuzz iteration
+static FUZZ_ITERATION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-mod error;
-pub use error::LocalSignerError;
+fuzz_target!(|data: (&[u8], Felt252, Felt252, Felt252, Felt252, u128)| {
+    // Define fuzzer iteration with id purposes
+    let _iteration_count = FUZZ_ITERATION_COUNT.fetch_add(1, Ordering::SeqCst);
 
-#[cfg(feature = "mnemonic")]
-mod mnemonic;
-#[cfg(feature = "mnemonic")]
-pub use mnemonic::{MnemonicBuilder, MnemonicBuilderError, MnemonicSignerIter};
+    // Define default configuration
+    let cairo_run_config = CairoRunConfig::default();
+    let mut hint_executor = BuiltinHintProcessor::new_empty();
 
-mod private_key;
+    let mut array = Vec::new();
+    let mut unstructured = Unstructured::new(data.0);
 
-#[cfg(feature = "yubihsm")]
-mod yubi;
+    for _x in 0..(data.5 as u8) {
+        array.push(Felt252::arbitrary(&mut unstructured).unwrap())
+    }
 
-#[cfg(feature = "yubihsm")]
-pub use yubihsm;
+    // Create and run the programs
+    program_array_sum(&array, &cairo_run_config, &mut hint_executor);
+    program_unsafe_keccak(&array, &cairo_run_config, &mut hint_executor);
+    program_bitwise(&data.1, &data.2, &cairo_run_config, &mut hint_executor);
+    program_poseidon(
+        &data.1,
+        &data.2,
+        &data.3,
+        &cairo_run_config,
+        &mut hint_executor,
+    );
+    program_range_check(
+        &data.1,
+        &data.2,
+        &data.3,
+        &cairo_run_config,
+        &mut hint_executor,
+    );
+    program_ec_op(data.5, &cairo_run_config, &mut hint_executor);
+    program_pedersen(&data.1, &data.2, &cairo_run_config, &mut hint_executor);
+    program_ecdsa(
+        &data.1,
+        &data.2,
+        &data.3,
+        &data.4,
+        &cairo_run_config,
+        &mut hint_executor,
+    );
+});
 
-#[cfg(feature = "mnemonic")]
-pub use coins_bip39;
+fn program_array_sum(
+    array: &Vec<Felt252>,
+    cairo_run_config: &CairoRunConfig,
+    hint_executor: &mut BuiltinHintProcessor,
+) {
+    let populated_array = array
+        .iter()
+        .enumerate()
+        .map(|(index, num)| format!("assert [ptr + {}] = {};\n", index, num))
+        .collect::<Vec<_>>()
+        .join("            ")
+        .repeat(array.len());
 
-/// A signer instantiated with a locally stored private key.
-pub type PrivateKeySigner = LocalSigner<k256::ecdsa::SigningKey>;
+    let file_content = format!(
+        "
+        %builtins output
 
-#[doc(hidden)]
-#[deprecated(note = "use `PrivateKeySigner` instead")]
-pub type LocalWallet = PrivateKeySigner;
+        from starkware.cairo.common.alloc import alloc
+        from starkware.cairo.common.serialize import serialize_word
+        
+        // Computes the sum of the memory elements at addresses:
+        //   arr + 0, arr + 1, ..., arr + (size - 1).
+        func array_sum(arr: felt*, size) -> (sum: felt) {{
+            if (size == 0) {{
+                return (sum=0);
+            }}
+        
+            // size is not zero.
+            let (sum_of_rest) = array_sum(arr=arr + 1, size=size - 1);
+            return (sum=[arr] + sum_of_rest);
+        }}
+        
+        func main{{output_ptr: felt*}}() {{
+            const ARRAY_SIZE = {};
+        
+            // Allocate an array.
+            let (ptr) = alloc();
+        
+            // Populate some values in the array.
+            {populated_array}
+        
+            // Call array_sum to compute the sum of the elements.
+            let (sum) = array_sum(arr=ptr, size=ARRAY_SIZE);
+        
+            // Write the sum to the program output.
+            serialize_word(sum);
+        
+            return ();
+    }}
+    ",
+        array.len()
+    );
 
-/// A signer instantiated with a YubiHSM.
-#[cfg(feature = "yubihsm")]
-pub type YubiSigner = LocalSigner<yubihsm::ecdsa::Signer<k256::Secp256k1>>;
+    // Create programs names and program
+    let cairo_path_array_sum = format!("cairo_programs/array_sum_{:?}.cairo", FUZZ_ITERATION_COUNT);
+    let json_path_array_sum = format!("cairo_programs/array_sum_{:?}.json", FUZZ_ITERATION_COUNT);
+    let _ = fs::write(&cairo_path_array_sum, file_content.as_bytes());
 
-#[cfg(feature = "yubihsm")]
-#[doc(hidden)]
-#[deprecated(note = "use `YubiSigner` instead")]
-pub type YubiWallet = YubiSigner;
+    compile_program(&cairo_path_array_sum, &json_path_array_sum);
 
-/// An Ethereum private-public key pair which can be used for signing messages.
-///
-/// # Examples
-///
-/// ## Signing and Verifying a message
-///
-/// The signer can be used to produce ECDSA [`Signature`] objects, which can be
-/// then verified. Note that this uses
-/// [`eip191_hash_message`](alloy_primitives::eip191_hash_message) under the hood which will
-/// prefix the message being hashed with the `Ethereum Signed Message` domain separator.
-///
-/// ```
-/// use alloy_signer::{Signer, SignerSync};
-/// use alloy_signer_local::PrivateKeySigner;
-///
-/// let signer = PrivateKeySigner::random();
-///
-/// // Optionally, the signer's chain id can be set, in order to use EIP-155
-/// // replay protection with different chains
-/// let signer = signer.with_chain_id(Some(1337));
-///
-/// // The signer can be used to sign messages
-/// let message = b"hello";
-/// let signature = signer.sign_message_sync(message)?;
-/// assert_eq!(signature.recover_address_from_msg(&message[..]).unwrap(), signer.address());
-///
-/// // LocalSigner is cloneable:
-/// let signer_clone = signer.clone();
-/// let signature2 = signer_clone.sign_message_sync(message)?;
-/// assert_eq!(signature, signature2);
-/// # Ok::<_, Box<dyn std::error::Error>>(())
-/// ```
-#[derive(Clone)]
-pub struct LocalSigner<C> {
-    /// The signer's credential.
-    pub(crate) credential: C,
-    /// The signer's address.
-    pub(crate) address: Address,
-    /// The signer's chain ID (for EIP-155).
-    pub(crate) chain_id: Option<ChainId>,
+    let program_content_array_sum = std::fs::read(&json_path_array_sum).unwrap();
+
+    // Run the program with default configurations
+    let _ = cairo_run::cairo_run(&program_content_array_sum, cairo_run_config, hint_executor);
+
+    // Remove files to save memory
+    delete_files(&cairo_path_array_sum, &json_path_array_sum);
 }
 
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
-impl<C: PrehashSigner<(ecdsa::Signature, RecoveryId)> + Send + Sync> Signer for LocalSigner<C> {
-    #[inline]
-    async fn sign_hash(&self, hash: &B256) -> Result<Signature> {
-        self.sign_hash_sync(hash)
-    }
+fn program_unsafe_keccak(
+    array: &Vec<Felt252>,
+    cairo_run_config: &CairoRunConfig,
+    hint_executor: &mut BuiltinHintProcessor,
+) {
+    let populated_array = array
+        .iter()
+        .enumerate()
+        .map(|(index, num)| format!("assert data[{}] = {};\n", index, num))
+        .collect::<Vec<_>>()
+        .join("            ");
 
-    #[inline]
-    fn address(&self) -> Address {
-        self.address
-    }
+    let file_content = format!(
+        "
+    %builtins output
 
-    #[inline]
-    fn chain_id(&self) -> Option<ChainId> {
-        self.chain_id
-    }
+    from starkware.cairo.common.alloc import alloc
+    from starkware.cairo.common.serialize import serialize_word
+    from starkware.cairo.common.keccak import unsafe_keccak
 
-    #[inline]
-    fn set_chain_id(&mut self, chain_id: Option<ChainId>) {
-        self.chain_id = chain_id;
-    }
+    func main{{output_ptr: felt*}}() {{
+        alloc_locals;
+
+        let (data: felt*) = alloc();
+
+        {populated_array}
+
+        let (low: felt, high: felt) = unsafe_keccak(data, {});
+
+        serialize_word(low);
+        serialize_word(high);
+
+        return ();
+    }}
+    ",
+        array.len()
+    );
+
+    // Create programs names and program
+    let cairo_path_unsafe_keccak = format!(
+        "cairo_programs/unsafe_keccak_{:?}.cairo",
+        FUZZ_ITERATION_COUNT
+    );
+    let json_path_unsafe_keccak = format!(
+        "cairo_programs/unsafe_keccak_{:?}.json",
+        FUZZ_ITERATION_COUNT
+    );
+    let _ = fs::write(&cairo_path_unsafe_keccak, file_content.as_bytes());
+
+    compile_program(&cairo_path_unsafe_keccak, &json_path_unsafe_keccak);
+
+    let program_content_unsafe_keccak = std::fs::read(&json_path_unsafe_keccak).unwrap();
+
+    // Run the program with default configurations
+    let _ = cairo_run::cairo_run(
+        &program_content_unsafe_keccak,
+        cairo_run_config,
+        hint_executor,
+    );
+
+    // Remove files to save memory
+    delete_files(&cairo_path_unsafe_keccak, &json_path_unsafe_keccak);
 }
 
-impl<C: PrehashSigner<(ecdsa::Signature, RecoveryId)>> SignerSync for LocalSigner<C> {
-    #[inline]
-    fn sign_hash_sync(&self, hash: &B256) -> Result<Signature> {
-        Ok(self.credential.sign_prehash(hash.as_ref())?.into())
-    }
+fn program_bitwise(
+    num1: &Felt252,
+    num2: &Felt252,
+    cairo_run_config: &CairoRunConfig,
+    hint_executor: &mut BuiltinHintProcessor,
+) {
+    use num_bigint::BigUint;
 
-    #[inline]
-    fn chain_id_sync(&self) -> Option<ChainId> {
-        self.chain_id
-    }
+    let bnum1 = &BigUint::from_bytes_be(&num1.to_bytes_be());
+    let bnum2 = &BigUint::from_bytes_be(&num2.to_bytes_be());
+
+    let and = bnum1 & bnum2;
+    let xor = bnum1 ^ bnum2;
+    let or = bnum1 | bnum2;
+    let file_content = format!(
+        "
+    %builtins bitwise
+    from starkware.cairo.common.bitwise import bitwise_and, bitwise_xor, bitwise_or, bitwise_operations
+    from starkware.cairo.common.cairo_builtins import BitwiseBuiltin
+
+    func main{{bitwise_ptr: BitwiseBuiltin*}}() {{
+        let (and_a) = bitwise_and({num1}, {num2});
+        assert and_a = {and};
+        let (xor_a) = bitwise_xor({num1}, {num2});
+        assert xor_a = {xor};
+        let (or_a) = bitwise_or({num1}, {num2});
+        assert or_a = {or};
+
+        let (and_b, xor_b, or_b) = bitwise_operations({num1}, {num2});
+        assert and_b = {and};
+        assert xor_b = {xor};
+        assert or_b = {or};
+        return ();
+    }}
+
+    ",
+        num1 = num1,
+        num2 = num2,
+        and = and,
+        xor = xor,
+        or = or
+    );
+
+    // Create programs names and program
+    let cairo_path_bitwise = format!("cairo_programs/bitwise-{:?}.cairo", FUZZ_ITERATION_COUNT);
+    let json_path_bitwise = format!("cairo_programs/bitwise-{:?}.json", FUZZ_ITERATION_COUNT);
+    let _ = fs::write(&cairo_path_bitwise, file_content.as_bytes());
+
+    compile_program(&cairo_path_bitwise, &json_path_bitwise);
+
+    let program_content_bitwise = std::fs::read(&json_path_bitwise).unwrap();
+
+    // Run the program with default configurations
+    let _ = cairo_run::cairo_run(&program_content_bitwise, cairo_run_config, hint_executor);
+
+    // Remove files to save memory
+    delete_files(&cairo_path_bitwise, &json_path_bitwise);
 }
 
-impl<C: PrehashSigner<(ecdsa::Signature, RecoveryId)>> LocalSigner<C> {
-    /// Construct a new credential with an external [`PrehashSigner`].
-    #[inline]
-    pub const fn new_with_credential(
-        credential: C,
-        address: Address,
-        chain_id: Option<ChainId>,
-    ) -> Self {
-        Self { credential, address, chain_id }
-    }
+fn program_poseidon(
+    num1: &Felt252,
+    num2: &Felt252,
+    num3: &Felt252,
+    cairo_run_config: &CairoRunConfig,
+    hint_executor: &mut BuiltinHintProcessor,
+) {
+    let file_content = format!(
+        "
+    %builtins poseidon
+    from starkware.cairo.common.cairo_builtins import PoseidonBuiltin
+    from starkware.cairo.common.poseidon_state import PoseidonBuiltinState
+    from starkware.cairo.common.builtin_poseidon.poseidon import (
+        poseidon_hash,
+        poseidon_hash_single,
+        poseidon_hash_many,
+    )
+    from starkware.cairo.common.alloc import alloc
 
-    /// Returns this signer's credential.
-    #[inline]
-    pub const fn credential(&self) -> &C {
-        &self.credential
-    }
+    func main{{poseidon_ptr: PoseidonBuiltin*}}() {{
+        // Hash one
+        let (x) = poseidon_hash_single(
+            {num3}
+        );
+        // Hash two
+        let (y) = poseidon_hash({num1}, {num2});
+        // Hash three
+        let felts: felt* = alloc();
+        assert felts[0] = {num1};
+        assert felts[1] = {num2};
+        assert felts[2] = {num3};
+        let (z) = poseidon_hash_many(3, felts);
+        return ();
+    }}
 
-    /// Consumes this signer and returns its credential.
-    #[inline]
-    pub fn into_credential(self) -> C {
-        self.credential
-    }
+    "
+    );
 
-    /// Returns this signer's address.
-    #[inline]
-    pub const fn address(&self) -> Address {
-        self.address
-    }
+    // Create programs names and program
+    let cairo_path_poseidon = format!("cairo_programs/poseidon_{:?}.cairo", FUZZ_ITERATION_COUNT);
+    let json_path_poseidon = format!("cairo_programs/poseidon_{:?}.json", FUZZ_ITERATION_COUNT);
+    let _ = fs::write(&cairo_path_poseidon, file_content.as_bytes());
 
-    /// Returns this signer's chain ID.
-    #[inline]
-    pub const fn chain_id(&self) -> Option<ChainId> {
-        self.chain_id
-    }
+    compile_program(&cairo_path_poseidon, &json_path_poseidon);
+
+    let program_content_poseidon = std::fs::read(&json_path_poseidon).unwrap();
+
+    // Run the program with default configurations
+    let _ = cairo_run::cairo_run(&program_content_poseidon, cairo_run_config, hint_executor);
+
+    // Remove files to save memory
+    delete_files(&cairo_path_poseidon, &json_path_poseidon);
 }
 
-// do not log the signer
-impl<C: PrehashSigner<(ecdsa::Signature, RecoveryId)>> fmt::Debug for LocalSigner<C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LocalSigner")
-            .field("address", &self.address)
-            .field("chain_id", &self.chain_id)
-            .finish()
-    }
+fn program_range_check(
+    num1: &Felt252,
+    num2: &Felt252,
+    num3: &Felt252,
+    cairo_run_config: &CairoRunConfig,
+    hint_executor: &mut BuiltinHintProcessor,
+) {
+    let file_content = format!(
+        "
+    %builtins range_check
+
+    from starkware.cairo.common.math import assert_250_bit
+    from starkware.cairo.common.alloc import alloc
+    
+    func assert_250_bit_element_array{{range_check_ptr: felt}}(
+        array: felt*, array_length: felt, iterator: felt
+    ) {{
+        if (iterator == array_length) {{
+            return ();
+        }}
+        assert_250_bit(array[iterator]);
+        return assert_250_bit_element_array(array, array_length, iterator + 1);
+    }}
+    
+    func fill_array(array: felt*, base: felt, step: felt, array_length: felt, iterator: felt) {{
+        if (iterator == array_length) {{
+            return ();
+        }}
+        assert array[iterator] = base + step * iterator;
+        return fill_array(array, base, step, array_length, iterator + 1);
+    }}
+    
+    func main{{range_check_ptr: felt}}() {{
+        alloc_locals;
+        tempvar array_length = {num1};
+        let (array: felt*) = alloc();
+        fill_array(array, {num2}, {num3}, array_length, 0);
+        assert_250_bit_element_array(array, array_length, 0);
+        return ();
+    }}
+    
+    "
+    );
+
+    // Create programs names and program
+    let cairo_path_range_check = format!(
+        "cairo_programs/range_check_{:?}.cairo",
+        FUZZ_ITERATION_COUNT
+    );
+    let json_path_range_check =
+        format!("cairo_programs/range_check_{:?}.json", FUZZ_ITERATION_COUNT);
+    let _ = fs::write(&cairo_path_range_check, file_content.as_bytes());
+
+    compile_program(&cairo_path_range_check, &json_path_range_check);
+
+    let program_content_range_check = std::fs::read(&json_path_range_check).unwrap();
+
+    // Run the program with default configurations
+    let _ = cairo_run::cairo_run(
+        &program_content_range_check,
+        cairo_run_config,
+        hint_executor,
+    );
+
+    // Remove files to save memory
+    delete_files(&cairo_path_range_check, &json_path_range_check);
 }
 
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
-impl<C> TxSigner<Signature> for LocalSigner<C>
-where
-    C: PrehashSigner<(ecdsa::Signature, RecoveryId)> + Send + Sync,
-{
-    fn address(&self) -> Address {
-        self.address
-    }
+fn program_ec_op(
+    num1: u128,
+    cairo_run_config: &CairoRunConfig,
+    hint_executor: &mut BuiltinHintProcessor,
+) {
+    let file_content = format!(
+        "
+    %builtins ec_op
 
-    #[doc(alias = "sign_tx")]
-    async fn sign_transaction(
-        &self,
-        tx: &mut dyn SignableTransaction<Signature>,
-    ) -> alloy_signer::Result<Signature> {
-        sign_transaction_with_chain_id!(self, tx, self.sign_hash_sync(&tx.signature_hash()))
-    }
+    from starkware.cairo.common.cairo_builtins import EcOpBuiltin
+    from starkware.cairo.common.ec_point import EcPoint
+    from starkware.cairo.common.ec import recover_y
+
+    func main{{ec_op_ptr: EcOpBuiltin*}}() {{
+        let x = {:#02x};
+        let r: EcPoint = recover_y(x);
+        assert r.x = {:#02x};
+        return ();
+    }}
+    
+    ",
+        num1, num1
+    );
+
+    // Create programs names and program
+    let cairo_path_ec_op = format!("cairo_programs/ec_op_{:?}.cairo", FUZZ_ITERATION_COUNT);
+    let json_path_ec_op = format!("cairo_programs/ec_op_{:?}.json", FUZZ_ITERATION_COUNT);
+    let _ = fs::write(&cairo_path_ec_op, file_content.as_bytes());
+
+    compile_program(&cairo_path_ec_op, &json_path_ec_op);
+
+    let program_content_ec_op = std::fs::read(&json_path_ec_op).unwrap();
+
+    // Run the program with default configurations
+    let _ = cairo_run::cairo_run(&program_content_ec_op, cairo_run_config, hint_executor);
+
+    // Remove files to save memory
+    delete_files(&cairo_path_ec_op, &json_path_ec_op);
 }
 
-impl<C> TxSignerSync<Signature> for LocalSigner<C>
-where
-    C: PrehashSigner<(ecdsa::Signature, RecoveryId)>,
-{
-    fn address(&self) -> Address {
-        self.address
-    }
+fn program_pedersen(
+    num1: &Felt252,
+    num2: &Felt252,
+    cairo_run_config: &CairoRunConfig,
+    hint_executor: &mut BuiltinHintProcessor,
+) {
+    let file_content = format!(
+        "
+    %builtins pedersen
 
-    #[doc(alias = "sign_tx_sync")]
-    fn sign_transaction_sync(
-        &self,
-        tx: &mut dyn SignableTransaction<Signature>,
-    ) -> alloy_signer::Result<Signature> {
-        sign_transaction_with_chain_id!(self, tx, self.sign_hash_sync(&tx.signature_hash()))
-    }
+    from starkware.cairo.common.cairo_builtins import HashBuiltin
+    from starkware.cairo.common.hash import hash2
+    
+    func get_hash(hash_ptr: HashBuiltin*, num_a: felt, num_b: felt) -> (
+        hash_ptr: HashBuiltin*, r: felt
+    ) {{
+        with hash_ptr {{
+            let (result) = hash2(num_a, num_b);
+        }}
+        return (hash_ptr=hash_ptr, r=result);
+    }}
+    
+    func builtins_wrapper{{
+        pedersen_ptr: HashBuiltin*,
+    }}(num_a: felt, num_b: felt) {{
+        let (pedersen_ptr, result: felt) = get_hash(pedersen_ptr, num_a, num_b);
+    
+        return ();
+    }}
+    
+    func builtins_wrapper_iter{{
+        pedersen_ptr: HashBuiltin*,
+    }}(num_a: felt, num_b: felt, n_iterations: felt) {{
+        builtins_wrapper(num_a, num_b);
+        if (n_iterations != 0) {{
+            builtins_wrapper_iter(num_a, num_b, n_iterations - 1);
+            tempvar pedersen_ptr = pedersen_ptr;
+        }} else {{
+            tempvar pedersen_ptr = pedersen_ptr;
+        }}
+    
+        return ();
+    }}
+    
+    func main{{
+        pedersen_ptr: HashBuiltin*,
+    }}() {{
+        let num_a = {num1};
+        let num_b = {num2};
+        builtins_wrapper_iter(num_a, num_b, 50000);
+    
+        return ();
+    }}
+    "
+    );
+
+    // Create programs names and program
+    let cairo_path_pedersen = format!("cairo_programs/pedersen_{:?}.cairo", FUZZ_ITERATION_COUNT);
+    let json_path_pedersen = format!("cairo_programs/pedersen_{:?}.json", FUZZ_ITERATION_COUNT);
+    let _ = fs::write(&cairo_path_pedersen, file_content.as_bytes());
+
+    compile_program(&cairo_path_pedersen, &json_path_pedersen);
+
+    let program_content_pedersen = std::fs::read(&json_path_pedersen).unwrap();
+
+    // Run the program with default configurations
+    let _ = cairo_run::cairo_run(&program_content_pedersen, cairo_run_config, hint_executor);
+
+    // Remove files to save memory
+    delete_files(&cairo_path_pedersen, &json_path_pedersen);
 }
 
-impl_into_wallet!(@[C: PrehashSigner<(ecdsa::Signature, RecoveryId)> + Send + Sync + 'static] LocalSigner<C>);
+fn program_ecdsa(
+    num1: &Felt252,
+    num2: &Felt252,
+    num3: &Felt252,
+    num4: &Felt252,
+    cairo_run_config: &CairoRunConfig,
+    hint_executor: &mut BuiltinHintProcessor,
+) {
+    let file_content = format!(
+        "
+    %builtins ecdsa
+    from starkware.cairo.common.serialize import serialize_word
+    from starkware.cairo.common.cairo_builtins import SignatureBuiltin
+    from starkware.cairo.common.signature import verify_ecdsa_signature
+    
+    func main{{ecdsa_ptr: SignatureBuiltin*}}() {{
+        verify_ecdsa_signature(
+            {num4},
+            {num1},
+            {num2},
+            {num3},
+        );
+        return ();
+    }}
+    
+    "
+    );
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use alloy_consensus::TxLegacy;
-    use alloy_primitives::{address, U256};
+    // Create programs names and program
+    let cairo_path_ecdsa = format!("cairo_programs/ecdsa_{:?}.cairo", FUZZ_ITERATION_COUNT);
+    let json_path_ecdsa = format!("cairo_programs/ecdsa_{:?}.json", FUZZ_ITERATION_COUNT);
+    let _ = fs::write(&cairo_path_ecdsa, file_content.as_bytes());
 
-    #[tokio::test]
-    async fn signs_tx() {
-        async fn sign_tx_test(tx: &mut TxLegacy, chain_id: Option<ChainId>) -> Result<Signature> {
-            let mut before = tx.clone();
-            let sig = sign_dyn_tx_test(tx, chain_id).await?;
-            if let Some(chain_id) = chain_id {
-                assert_eq!(tx.chain_id, Some(chain_id), "chain ID was not set");
-                before.chain_id = Some(chain_id);
-            }
-            assert_eq!(*tx, before);
-            Ok(sig)
-        }
+    compile_program(&cairo_path_ecdsa, &json_path_ecdsa);
 
-        async fn sign_dyn_tx_test(
-            tx: &mut dyn SignableTransaction<Signature>,
-            chain_id: Option<ChainId>,
-        ) -> Result<Signature> {
-            let mut signer: PrivateKeySigner =
-                "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318".parse().unwrap();
-            signer.set_chain_id(chain_id);
+    let program_content_ecdsa = std::fs::read(&json_path_ecdsa).unwrap();
 
-            let sig = signer.sign_transaction_sync(tx)?;
-            let sighash = tx.signature_hash();
-            assert_eq!(sig.recover_address_from_prehash(&sighash).unwrap(), signer.address());
+    // Run the program with default configurations
+    let _ = cairo_run::cairo_run(&program_content_ecdsa, cairo_run_config, hint_executor);
 
-            let sig_async = signer.sign_transaction(tx).await.unwrap();
-            assert_eq!(sig_async, sig);
+    // Remove files to save memory
+    delete_files(&cairo_path_ecdsa, &json_path_ecdsa);
+}
 
-            Ok(sig)
-        }
+fn compile_program(cairo_path: &str, json_path: &str) {
+    let _output = Command::new("cairo-compile")
+        .arg(cairo_path)
+        .arg("--output")
+        .arg(json_path)
+        .output()
+        .expect("failed to execute process");
+}
 
-        // retrieved test vector from:
-        // https://web3js.readthedocs.io/en/v1.2.0/web3-eth-accounts.html#eth-accounts-signtransaction
-        let mut tx = TxLegacy {
-            to: address!("F0109fC8DF283027b6285cc889F5aA624EaC1F55").into(),
-            value: U256::from(1_000_000_000),
-            gas_limit: 2_000_000,
-            nonce: 0,
-            gas_price: 21_000_000_000,
-            input: Default::default(),
-            chain_id: None,
-        };
-        let sig_none = sign_tx_test(&mut tx, None).await.unwrap();
-
-        tx.chain_id = Some(1);
-        let sig_1 = sign_tx_test(&mut tx, None).await.unwrap();
-        let expected = "c9cf86333bcb065d140032ecaab5d9281bde80f21b9687b3e94161de42d51895727a108a0b8d101465414033c3f705a9c7b826e596766046ee1183dbc8aeaa6825".parse().unwrap();
-        assert_eq!(sig_1, expected);
-        assert_ne!(sig_1, sig_none);
-
-        tx.chain_id = Some(2);
-        let sig_2 = sign_tx_test(&mut tx, None).await.unwrap();
-        assert_ne!(sig_2, sig_1);
-        assert_ne!(sig_2, sig_none);
-
-        // Sets chain ID.
-        tx.chain_id = None;
-        let sig_none_none = sign_tx_test(&mut tx, None).await.unwrap();
-        assert_eq!(sig_none_none, sig_none);
-
-        tx.chain_id = None;
-        let sig_none_1 = sign_tx_test(&mut tx, Some(1)).await.unwrap();
-        assert_eq!(sig_none_1, sig_1);
-
-        tx.chain_id = None;
-        let sig_none_2 = sign_tx_test(&mut tx, Some(2)).await.unwrap();
-        assert_eq!(sig_none_2, sig_2);
-
-        // Errors on mismatch.
-        tx.chain_id = Some(2);
-        let error = sign_tx_test(&mut tx, Some(1)).await.unwrap_err();
-        let expected_error = alloy_signer::Error::TransactionChainIdMismatch { signer: 1, tx: 2 };
-        assert_eq!(error.to_string(), expected_error.to_string());
-    }
-
-    // <https://github.com/alloy-rs/core/issues/705>
-    #[test]
-    fn test_parity() {
-        let signer = PrivateKeySigner::random();
-        let message = b"hello";
-        let signature = signer.sign_message_sync(message).unwrap();
-        let value = signature.as_bytes().to_vec();
-        let recovered_signature: Signature = value.as_slice().try_into().unwrap();
-        assert_eq!(signature, recovered_signature);
-    }
+fn delete_files(cairo_path: &str, json_path: &str) {
+    fs::remove_file(cairo_path).expect("failed to remove file");
+    fs::remove_file(json_path).expect("failed to remove file");
 }
