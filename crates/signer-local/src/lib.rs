@@ -161,6 +161,15 @@ impl<C: PrehashSigner<(ecdsa::Signature, RecoveryId)>> LocalSigner<C> {
     pub const fn chain_id(&self) -> Option<ChainId> {
         self.chain_id
     }
+
+    /// Returns a new signer with the given chain ID (builder-style).
+    ///
+    /// This matches the usage in the crate-level docs.
+    #[inline]
+    pub fn with_chain_id(mut self, chain_id: Option<ChainId>) -> Self {
+        self.chain_id = chain_id;
+        self
+    }
 }
 
 // do not log the signer
@@ -301,5 +310,5 @@ mod test {
         let value = signature.as_bytes().to_vec();
         let recovered_signature: Signature = value.as_slice().try_into().unwrap();
         assert_eq!(signature, recovered_signature);
-    }
+        }
 }
